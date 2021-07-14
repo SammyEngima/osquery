@@ -224,7 +224,7 @@ void SchedulerRunner::maybeReloadSchedule(uint64_t time_step) {
 void SchedulerRunner::maybeFlushLogs(uint64_t time_step) {
   // GLog is not re-entrant, so logs must be flushed in a dedicated thread.
   if ((time_step % 3) == 0) {
-    relayStatusLogs(true);
+    relayStatusLogs(LoggerRelayMode::Async);
   }
 }
 
@@ -267,7 +267,7 @@ void SchedulerRunner::start() {
   }
 
   // Scheduler ended.
-  if (!interrupted()) {
+  if (!interrupted() && request_shutdown_on_expiration) {
     LOG(INFO) << "The scheduler ended after " << timeout_ << " seconds";
     requestShutdown();
   }

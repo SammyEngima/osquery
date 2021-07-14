@@ -33,6 +33,7 @@
 #include <osquery/sql/sql.h>
 
 #include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/info/platform_type.h>
 #include <osquery/utils/info/tool_type.h>
 #include <osquery/utils/system/time.h>
 
@@ -47,10 +48,10 @@ struct LimitDefinition {
 };
 
 struct PerformanceChange {
-  size_t sustained_latency;
-  uint64_t footprint;
-  uint64_t iv;
-  pid_t parent;
+  size_t sustained_latency{0};
+  uint64_t footprint{0};
+  uint64_t iv{0};
+  pid_t parent{0};
 };
 
 using WatchdogLimitMap = std::map<WatchdogLimitType, LimitDefinition>;
@@ -110,6 +111,8 @@ CLI_FLAG(bool,
          "Enable userland watchdog for extensions processes");
 
 CLI_FLAG(bool, disable_watchdog, false, "Disable userland watchdog process");
+
+DECLARE_uint64(alarm_timeout);
 
 void Watcher::resetWorkerCounters(uint64_t respawn_time) {
   // Reset the monitoring counters for the watcher.
@@ -271,15 +274,31 @@ void WatcherRunner::start() {
 }
 
 void WatcherRunner::stop() {
-  for (const auto& extension : watcher_->extensions()) {
+  auto stop_extension = [this](
+                            const std::string& extension_name,
+                            const std::shared_ptr<PlatformProcess> extension) {
     try {
-      stopChild(*extension.second);
+      stopChild(*extension);
     } catch (std::exception& e) {
       LOG(ERROR) << "[WatcherRunner] couldn't kill the extension "
-                 << extension.first << "nicely. Reason: " << e.what()
+                 << extension_name << "nicely. Reason: " << e.what()
                  << std::endl;
-      extension.second->kill();
+      extension->kill();
     }
+  };
+
+  std::vector<std::thread> stop_extensions_threads;
+  for (const auto& extension : watcher_->extensions()) {
+    stop_extensions_threads.emplace_back(
+        stop_extension, extension.first, extension.second);
+  }
+
+  if (watcher_->getWorker().isValid()) {
+    stopChild(watcher_->getWorker());
+  }
+
+  for (auto& thread : stop_extensions_threads) {
+    thread.join();
   }
 }
 
@@ -288,14 +307,17 @@ void WatcherRunner::watchExtensions() {
   for (const auto& extension : watcher_->extensions()) {
     // Check the extension status, causing a wait.
     int process_status = 0;
-    extension.second->checkStatus(process_status);
+    ProcessState status = extension.second->checkStatus(process_status);
 
-    auto ext_valid = extension.second->isValid();
-    auto s = isChildSane(*extension.second);
+    bool ext_valid = (PROCESS_STILL_ALIVE == status);
 
-    if (!ext_valid || (!s.ok() && getUnixTime() >= delayedTime())) {
-      if (ext_valid && FLAGS_enable_extensions_watchdog) {
-        // The extension was already launched once.
+    // If the extension is alive and watched, check sanity
+    if (ext_valid && FLAGS_enable_extensions_watchdog) {
+      if (getUnixTime() < delayedTime()) {
+        return;
+      }
+      auto s = isChildSane(*extension.second);
+      if (!s.ok()) {
         std::stringstream error;
         error << "osquery extension " << extension.first << " ("
               << extension.second->pid() << ") stopping: " << s.getMessage();
@@ -304,8 +326,11 @@ void WatcherRunner::watchExtensions() {
         stopChild(*extension.second);
         pause(
             std::chrono::seconds(getWorkerLimit(WatchdogLimitType::INTERVAL)));
+        ext_valid = false;
       }
+    }
 
+    if (!ext_valid) {
       // The extension manager also watches for extension-related failures.
       // The watchdog is more general, but may find failed extensions first.
       createExtension(extension.first);
@@ -359,17 +384,21 @@ bool WatcherRunner::watch(const PlatformProcess& child) const {
 }
 
 void WatcherRunner::stopChild(const PlatformProcess& child) const {
+  /* We leave 2 seconds for the rest of the logic to shutdown,
+   and 2 seconds for the forced kill to do the reaping */
+  auto timeout = (FLAGS_alarm_timeout - 4) * 1000;
+
   child.killGracefully();
 
   // Clean up the defunct (zombie) process.
-  if (!child.cleanup()) {
+  if (!child.cleanup(std::chrono::milliseconds(timeout))) {
     auto child_pid = child.pid();
 
     LOG(WARNING) << "osqueryd worker (" << std::to_string(child_pid)
                  << ") could not be stopped. Sending kill signal.";
 
     child.kill();
-    if (!child.cleanup()) {
+    if (!child.cleanup(std::chrono::milliseconds(2000))) {
       auto message = std::string("Watcher cannot stop worker process (") +
                      std::to_string(child_pid) + ").";
       requestShutdown(EXIT_CATASTROPHIC, message);
@@ -388,7 +417,11 @@ PerformanceChange getChange(const Row& r, PerformanceState& state) {
         static_cast<pid_t>(tryTo<long long>(r.at("parent")).takeOr(0LL));
     user_time = tryTo<long long>(r.at("user_time")).takeOr(0LL);
     system_time = tryTo<long long>(r.at("system_time")).takeOr(0LL);
-    change.footprint = tryTo<long long>(r.at("resident_size")).takeOr(0LL);
+    if (isPlatform(PlatformType::TYPE_WINDOWS)) {
+      change.footprint = tryTo<long long>(r.at("total_size")).takeOr(0LL);
+    } else {
+      change.footprint = tryTo<long long>(r.at("resident_size")).takeOr(0LL);
+    }
   } catch (const std::exception& /* e */) {
     state.sustained_latency = 0;
   }
@@ -479,7 +512,7 @@ QueryData WatcherRunner::getProcessRow(pid_t pid) const {
   p = (pid == ULONG_MAX) ? -1 : pid;
 #endif
   return SQL::selectFrom(
-      {"parent", "user_time", "system_time", "resident_size"},
+      {"parent", "user_time", "system_time", "resident_size", "total_size"},
       "processes",
       "pid",
       EQUALS,

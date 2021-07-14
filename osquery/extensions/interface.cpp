@@ -34,6 +34,32 @@ const std::vector<std::string> kSDKVersionChanges = {
     {"1.7.7"},
 };
 
+class UuidGenerator {
+ public:
+  uint16_t getUuid() {
+    uint16_t uuid = static_cast<uint16_t>(rand() + 1);
+    {
+      WriteLock lock(uuid_mutex_);
+      while (uuids_.find(uuid) != uuids_.end()) {
+        uuid = static_cast<uint16_t>(rand() + 1);
+      }
+      uuids_.insert(uuid);
+    }
+    return uuid;
+  }
+
+  void removeUuid(RouteUUID& uuid) {
+    WriteLock lock(uuid_mutex_);
+    uuids_.erase(uuid);
+  }
+
+ private:
+  std::unordered_set<uint16_t> uuids_;
+  Mutex uuid_mutex_;
+};
+
+UuidGenerator kUuidGenerator;
+
 Status ExtensionInterface::ping() {
   // Need to translate return code into 0 and extract the UUID.
   assert(uuid_ < INT_MAX);
@@ -94,7 +120,8 @@ Status ExtensionManagerInterface::registerExtension(
   for (const auto& change : kSDKVersionChanges) {
     if (!versionAtLeast(change, info.sdk_version)) {
       LOG(WARNING) << "Could not add extension " << info.name
-                   << ": incompatible extension SDK " << info.sdk_version;
+                   << ": incompatible extension SDK " << info.sdk_version
+                   << ", minimum required is " << change;
       return Status((int)ExtensionCode::EXT_FAILED,
                     "Incompatible extension SDK version");
     }
@@ -106,7 +133,7 @@ Status ExtensionManagerInterface::registerExtension(
         chrono_clock::now().time_since_epoch().count()));
   }
   // Every call to registerExtension is assigned a new RouteUUID.
-  uuid = static_cast<uint16_t>(rand() + 1);
+  uuid = kUuidGenerator.getUuid();
   LOG(INFO) << "Registering extension (" << info.name << ", " << uuid
             << ", version=" << info.version << ", sdk=" << info.sdk_version
             << ")";
@@ -115,6 +142,7 @@ Status ExtensionManagerInterface::registerExtension(
   if (!status.ok()) {
     LOG(WARNING) << "Could not add extension " << info.name << ": "
                  << status.getMessage();
+    kUuidGenerator.removeUuid(uuid);
     return Status((int)ExtensionCode::EXT_FAILED,
                   "Failed adding registry: " + status.getMessage());
   }
@@ -141,6 +169,7 @@ Status ExtensionManagerInterface::deregisterExtension(RouteUUID uuid) {
 
   WriteLock lock(extensions_mutex_);
   extensions_.erase(uuid);
+  kUuidGenerator.removeUuid(uuid);
   return Status::success();
 }
 

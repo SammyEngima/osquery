@@ -12,6 +12,13 @@ function(sqliteMain)
   target_link_libraries(thirdparty_sqlite PRIVATE
     thirdparty_c_settings
   )
+
+  if(DEFINED PLATFORM_POSIX)
+    # Allow tables to rethrow exceptions
+    target_compile_options(thirdparty_sqlite PRIVATE
+      -fexceptions
+    )
+  endif()
 endfunction()
 
 sqliteMain()
